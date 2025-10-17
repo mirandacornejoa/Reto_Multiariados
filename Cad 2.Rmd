@@ -1,0 +1,1003 @@
+---
+title: "Cadereyta V2"
+author: "Hugo Jaime Valdés A01384039"
+date: "2025-10-17"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(error = TRUE) 
+```
+
+# Juarez
+## SO2
+```{r}
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(car)
+library(lmtest)
+library(nortest)
+library(tseries)
+
+cad  <- read_excel("cadereyta_SE3.xlsx")
+jua  <- read_excel("cadereyta_SE2.xlsx")
+
+find_date_col <- function(df){
+  cand <- grep("date|fecha|time|datetime|hora", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(cand) == 0) stop("No se encontró una columna de fecha/hora. Renombra o agrega una.")
+  cand[1]
+}
+
+DATE_COL_CAD <- find_date_col(cad)
+DATE_COL_JUA <- find_date_col(jua)
+
+parse_dt <- function(df, date_col) {
+  # Intenta varios formatos comunes
+  df %>%
+    mutate(
+      .dt_raw = .data[[date_col]],
+      .dt = suppressWarnings(parse_date_time(
+        .dt_raw,
+        orders = c("Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
+                   "d/m/Y H:M:S", "d/m/Y H:M", "d/m/Y",
+                   "Ymd HMS", "Ymd HM", "Ymd")
+      ))
+    )
+}
+
+cad <- parse_dt(cad, DATE_COL_CAD)
+jua <- parse_dt(jua, DATE_COL_JUA)
+
+if (all(is.na(cad$.dt))) stop("No se pudo parsear la fecha/hora en Cadereyta.")
+if (all(is.na(jua$.dt))) stop("No se pudo parsear la fecha/hora en Juárez.")
+
+# Función auxiliar: obtener el 15.º miércoles del año
+nth_wednesday <- function(dt_vec, n = 15) {
+  # Extraer solo las fechas (sin hora)
+  dates <- lubridate::as_date(dt_vec)
+  # Filtrar los miércoles
+  wed_dates <- sort(unique(dates[lubridate::wday(dates, week_start = 1) == 3]))
+  if (length(wed_dates) < n) stop("No hay suficientes miércoles en los datos.")
+  wed_dates[n]
+}
+
+# Obtener el 15.º miércoles
+WED_DT <- nth_wednesday(cad$.dt, n = 15)
+
+# Definir rango de ese día (solo ese miércoles)
+START_DT <- as.POSIXct(WED_DT, tz = lubridate::tz(cad$.dt))
+END_DT   <- START_DT + lubridate::days(1)
+
+message(sprintf("Día seleccionado: [%s, %s)", START_DT, END_DT))
+
+# Filtrar solo los registros de ese miércoles
+cad_w <- cad %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+jua_w <- jua %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+
+stopifnot(nrow(cad_w) > 2, nrow(jua_w) > 2)
+
+cad_w <- cad_w %>% select(-any_of(c(DATE_COL_CAD, ".dt_raw", ".dt")))
+jua_w <- jua_w %>% select(-any_of(c(DATE_COL_JUA, ".dt_raw", ".dt")))
+
+cad_w <- cad_w %>% select(-any_of("NOX"))
+jua_w <- jua_w %>% select(-any_of("NOX"))
+
+
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+
+TARGET <- "SO2"
+
+stopifnot(TARGET %in% names(cad_w), TARGET %in% names(jua_w))
+
+num_cols <- cad_w %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # ajusta si es necesario
+x_cols <- setdiff(num_cols, drop_cols)
+
+x_cols <- x_cols[x_cols %in% names(cad_w)]
+stopifnot(length(x_cols) > 0)
+
+sd_vec <- sapply(cad_w[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad_w[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+
+scale_stats <- cad_w %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE),
+                        sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad_w, scale_stats, x_cols)
+jua_s <- scale_apply(jua_w, scale_stats, x_cols)
+
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+print(summary(modelo_SO2))
+
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> dplyr::mutate(dataset = "Cadereyta (train, 1 semana)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> dplyr::mutate(dataset = "Juárez (test, 1 semana)")
+
+print(bind_rows(train_met, test_met))
+
+print(vif(modelo_SO2))
+print(bptest(modelo_SO2))
+print(dwtest(modelo_SO2))
+
+print(ad.test(resid(modelo_SO2)))
+print(lillie.test(scale(resid(modelo_SO2))))
+print(jarque.bera.test(resid(modelo_SO2)))
+
+# QQ plot
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta (1 semana)", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez (misma semana)", x = "Observado", y = "Predicho")
+
+p_train + p_test
+
+```
+
+## PM10
+```{r}
+cad  <- read_excel("cadereyta_SE3.xlsx")
+jua  <- read_excel("cadereyta_SE2.xlsx")
+
+find_date_col <- function(df){
+  cand <- grep("date|fecha|time|datetime|hora", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(cand) == 0) stop("No se encontró una columna de fecha/hora. Renombra o agrega una.")
+  cand[1]
+}
+
+DATE_COL_CAD <- find_date_col(cad)
+DATE_COL_JUA <- find_date_col(jua)
+
+parse_dt <- function(df, date_col) {
+  # Intenta varios formatos comunes
+  df %>%
+    mutate(
+      .dt_raw = .data[[date_col]],
+      .dt = suppressWarnings(parse_date_time(
+        .dt_raw,
+        orders = c("Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
+                   "d/m/Y H:M:S", "d/m/Y H:M", "d/m/Y",
+                   "Ymd HMS", "Ymd HM", "Ymd")
+      ))
+    )
+}
+
+cad <- parse_dt(cad, DATE_COL_CAD)
+jua <- parse_dt(jua, DATE_COL_JUA)
+
+if (all(is.na(cad$.dt))) stop("No se pudo parsear la fecha/hora en Cadereyta.")
+if (all(is.na(jua$.dt))) stop("No se pudo parsear la fecha/hora en Juárez.")
+
+# Función auxiliar: obtener el 15.º miércoles del año
+nth_wednesday <- function(dt_vec, n = 15) {
+  # Extraer solo las fechas (sin hora)
+  dates <- lubridate::as_date(dt_vec)
+  # Filtrar los miércoles
+  wed_dates <- sort(unique(dates[lubridate::wday(dates, week_start = 1) == 3]))
+  if (length(wed_dates) < n) stop("No hay suficientes miércoles en los datos.")
+  wed_dates[n]
+}
+
+# Obtener el 15.º miércoles
+WED_DT <- nth_wednesday(cad$.dt, n = 15)
+
+# Definir rango de ese día (solo ese miércoles)
+START_DT <- as.POSIXct(WED_DT, tz = lubridate::tz(cad$.dt))
+END_DT   <- START_DT + lubridate::days(1)
+
+message(sprintf("Día seleccionado: [%s, %s)", START_DT, END_DT))
+
+# Filtrar solo los registros de ese miércoles
+cad_w <- cad %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+jua_w <- jua %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+
+stopifnot(nrow(cad_w) > 2, nrow(jua_w) > 2)
+
+cad_w <- cad_w %>% select(-any_of(c(DATE_COL_CAD, ".dt_raw", ".dt")))
+jua_w <- jua_w %>% select(-any_of(c(DATE_COL_JUA, ".dt_raw", ".dt")))
+
+cad_w <- cad_w %>% select(-any_of("NOX"))
+jua_w <- jua_w %>% select(-any_of("NOX"))
+
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+
+TARGET <- "PM10"
+
+stopifnot(TARGET %in% names(cad_w), TARGET %in% names(jua_w))
+
+num_cols <- cad_w %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")
+x_cols <- setdiff(num_cols, drop_cols)
+
+x_cols <- x_cols[x_cols %in% names(cad_w)]
+stopifnot(length(x_cols) > 0)
+
+sd_vec <- sapply(cad_w[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad_w[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+
+scale_stats <- cad_w %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE),
+                        sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad_w, scale_stats, x_cols)
+jua_s <- scale_apply(jua_w, scale_stats, x_cols)
+
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+print(summary(modelo_SO2))
+
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> dplyr::mutate(dataset = "Cadereyta (train, 1 semana)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> dplyr::mutate(dataset = "Juárez (test, 1 semana)")
+
+print(bind_rows(train_met, test_met))
+
+print(vif(modelo_SO2))
+print(bptest(modelo_SO2))
+print(dwtest(modelo_SO2))
+
+print(ad.test(resid(modelo_SO2)))
+print(lillie.test(scale(resid(modelo_SO2))))
+print(jarque.bera.test(resid(modelo_SO2)))
+
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta (1 semana)", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez (misma semana)", x = "Observado", y = "Predicho")
+
+p_train + p_test
+
+```
+
+## PM2.5
+
+```{r}
+cad  <- read_excel("cadereyta_SE3.xlsx")
+jua  <- read_excel("cadereyta_SE2.xlsx")
+
+find_date_col <- function(df){
+  cand <- grep("date|fecha|time|datetime|hora", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(cand) == 0) stop("No se encontró una columna de fecha/hora. Renombra o agrega una.")
+  cand[1]
+}
+
+DATE_COL_CAD <- find_date_col(cad)
+DATE_COL_JUA <- find_date_col(jua)
+
+parse_dt <- function(df, date_col) {
+  df %>%
+    mutate(
+      .dt_raw = .data[[date_col]],
+      .dt = suppressWarnings(parse_date_time(
+        .dt_raw,
+        orders = c("Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
+                   "d/m/Y H:M:S", "d/m/Y H:M", "d/m/Y",
+                   "Ymd HMS", "Ymd HM", "Ymd")
+      ))
+    )
+}
+
+cad <- parse_dt(cad, DATE_COL_CAD)
+jua <- parse_dt(jua, DATE_COL_JUA)
+
+if (all(is.na(cad$.dt))) stop("No se pudo parsear la fecha/hora en Cadereyta.")
+if (all(is.na(jua$.dt))) stop("No se pudo parsear la fecha/hora en Juárez.")
+
+# Función auxiliar: obtener el 15.º miércoles del año
+nth_wednesday <- function(dt_vec, n = 15) {
+  # Extraer solo las fechas (sin hora)
+  dates <- lubridate::as_date(dt_vec)
+  # Filtrar los miércoles
+  wed_dates <- sort(unique(dates[lubridate::wday(dates, week_start = 1) == 3]))
+  if (length(wed_dates) < n) stop("No hay suficientes miércoles en los datos.")
+  wed_dates[n]
+}
+
+# Obtener el 15.º miércoles
+WED_DT <- nth_wednesday(cad$.dt, n = 15)
+
+# Definir rango de ese día (solo ese miércoles)
+START_DT <- as.POSIXct(WED_DT, tz = lubridate::tz(cad$.dt))
+END_DT   <- START_DT + lubridate::days(1)
+
+message(sprintf("Día seleccionado: [%s, %s)", START_DT, END_DT))
+
+# Filtrar solo los registros de ese miércoles
+cad_w <- cad %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+jua_w <- jua %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+
+stopifnot(nrow(cad_w) > 2, nrow(jua_w) > 2)
+
+cad_w <- cad_w %>% select(-any_of(c(DATE_COL_CAD, ".dt_raw", ".dt")))
+jua_w <- jua_w %>% select(-any_of(c(DATE_COL_JUA, ".dt_raw", ".dt")))
+
+cad_w <- cad_w %>% select(-any_of("NOX"))
+jua_w <- jua_w %>% select(-any_of("NOX"))
+
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+
+TARGET <- "PM2.5"
+
+stopifnot(TARGET %in% names(cad_w), TARGET %in% names(jua_w))
+
+num_cols <- cad_w %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")
+x_cols <- setdiff(num_cols, drop_cols)
+
+x_cols <- x_cols[x_cols %in% names(cad_w)]
+stopifnot(length(x_cols) > 0)
+
+sd_vec <- sapply(cad_w[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad_w[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+
+scale_stats <- cad_w %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE),
+                        sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad_w, scale_stats, x_cols)
+jua_s <- scale_apply(jua_w, scale_stats, x_cols)
+
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+print(summary(modelo_SO2))
+
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> dplyr::mutate(dataset = "Cadereyta (train, 1 semana)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> dplyr::mutate(dataset = "Juárez (test, 1 semana)")
+
+print(bind_rows(train_met, test_met))
+
+print(vif(modelo_SO2))
+print(bptest(modelo_SO2))
+print(dwtest(modelo_SO2))
+
+print(ad.test(resid(modelo_SO2)))
+print(lillie.test(scale(resid(modelo_SO2))))
+print(jarque.bera.test(resid(modelo_SO2)))
+
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta (1 semana)", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez (misma semana)", x = "Observado", y = "Predicho")
+
+p_train + p_test
+
+```
+
+# Guadalupe
+
+## SO2
+```{r}
+cad  <- read_excel("cadereyta_SE3.xlsx")
+jua  <- read_excel("cadereyta_SE.xlsx")
+
+find_date_col <- function(df){
+  cand <- grep("date|fecha|time|datetime|hora", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(cand) == 0) stop("No se encontró una columna de fecha/hora. Renombra o agrega una.")
+  cand[1]
+}
+
+DATE_COL_CAD <- find_date_col(cad)
+DATE_COL_JUA <- find_date_col(jua)
+
+parse_dt <- function(df, date_col) {
+  df %>%
+    mutate(
+      .dt_raw = .data[[date_col]],
+      .dt = suppressWarnings(parse_date_time(
+        .dt_raw,
+        orders = c("Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
+                   "d/m/Y H:M:S", "d/m/Y H:M", "d/m/Y",
+                   "Ymd HMS", "Ymd HM", "Ymd")
+      ))
+    )
+}
+
+cad <- parse_dt(cad, DATE_COL_CAD)
+jua <- parse_dt(jua, DATE_COL_JUA)
+
+if (all(is.na(cad$.dt))) stop("No se pudo parsear la fecha/hora en Cadereyta.")
+if (all(is.na(jua$.dt))) stop("No se pudo parsear la fecha/hora en Juárez.")
+
+# Función auxiliar: obtener el 15.º miércoles del año
+nth_wednesday <- function(dt_vec, n = 15) {
+  # Extraer solo las fechas (sin hora)
+  dates <- lubridate::as_date(dt_vec)
+  # Filtrar los miércoles
+  wed_dates <- sort(unique(dates[lubridate::wday(dates, week_start = 1) == 3]))
+  if (length(wed_dates) < n) stop("No hay suficientes miércoles en los datos.")
+  wed_dates[n]
+}
+
+# Obtener el 15.º miércoles
+WED_DT <- nth_wednesday(cad$.dt, n = 15)
+
+# Definir rango de ese día (solo ese miércoles)
+START_DT <- as.POSIXct(WED_DT, tz = lubridate::tz(cad$.dt))
+END_DT   <- START_DT + lubridate::days(1)
+
+message(sprintf("Día seleccionado: [%s, %s)", START_DT, END_DT))
+
+# Filtrar solo los registros de ese miércoles
+cad_w <- cad %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+jua_w <- jua %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+
+stopifnot(nrow(cad_w) > 2, nrow(jua_w) > 2)
+
+cad_w <- cad_w %>% select(-any_of(c(DATE_COL_CAD, ".dt_raw", ".dt")))
+jua_w <- jua_w %>% select(-any_of(c(DATE_COL_JUA, ".dt_raw", ".dt")))
+
+cad_w <- cad_w %>% select(-any_of("NOX"))
+jua_w <- jua_w %>% select(-any_of("NOX"))
+
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+
+TARGET <- "SO2"
+
+stopifnot(TARGET %in% names(cad_w), TARGET %in% names(jua_w))
+
+num_cols <- cad_w %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")
+x_cols <- setdiff(num_cols, drop_cols)
+
+x_cols <- x_cols[x_cols %in% names(cad_w)]
+stopifnot(length(x_cols) > 0)
+
+sd_vec <- sapply(cad_w[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad_w[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+
+scale_stats <- cad_w %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE),
+                        sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad_w, scale_stats, x_cols)
+jua_s <- scale_apply(jua_w, scale_stats, x_cols)
+
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+print(summary(modelo_SO2))
+
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> dplyr::mutate(dataset = "Cadereyta (train, 1 semana)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> dplyr::mutate(dataset = "Guadalupe (test, 1 semana)")
+
+print(bind_rows(train_met, test_met))
+
+print(vif(modelo_SO2))
+print(bptest(modelo_SO2))
+print(dwtest(modelo_SO2))
+
+print(ad.test(resid(modelo_SO2)))
+print(lillie.test(scale(resid(modelo_SO2))))
+print(jarque.bera.test(resid(modelo_SO2)))
+
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta (1 semana)", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Guadalupe (misma semana)", x = "Observado", y = "Predicho")
+
+p_train + p_test
+
+```
+
+## PM10
+```{r}
+cad  <- read_excel("cadereyta_SE3.xlsx")
+jua  <- read_excel("cadereyta_SE.xlsx")
+
+find_date_col <- function(df){
+  cand <- grep("date|fecha|time|datetime|hora", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(cand) == 0) stop("No se encontró una columna de fecha/hora. Renombra o agrega una.")
+  cand[1]
+}
+
+DATE_COL_CAD <- find_date_col(cad)
+DATE_COL_JUA <- find_date_col(jua)
+
+parse_dt <- function(df, date_col) {
+  df %>%
+    mutate(
+      .dt_raw = .data[[date_col]],
+      .dt = suppressWarnings(parse_date_time(
+        .dt_raw,
+        orders = c("Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
+                   "d/m/Y H:M:S", "d/m/Y H:M", "d/m/Y",
+                   "Ymd HMS", "Ymd HM", "Ymd")
+      ))
+    )
+}
+
+cad <- parse_dt(cad, DATE_COL_CAD)
+jua <- parse_dt(jua, DATE_COL_JUA)
+
+if (all(is.na(cad$.dt))) stop("No se pudo parsear la fecha/hora en Cadereyta.")
+if (all(is.na(jua$.dt))) stop("No se pudo parsear la fecha/hora en Juárez.")
+
+# Función auxiliar: obtener el 15.º miércoles del año
+nth_wednesday <- function(dt_vec, n = 15) {
+  # Extraer solo las fechas (sin hora)
+  dates <- lubridate::as_date(dt_vec)
+  # Filtrar los miércoles
+  wed_dates <- sort(unique(dates[lubridate::wday(dates, week_start = 1) == 3]))
+  if (length(wed_dates) < n) stop("No hay suficientes miércoles en los datos.")
+  wed_dates[n]
+}
+
+# Obtener el 15.º miércoles
+WED_DT <- nth_wednesday(cad$.dt, n = 15)
+
+# Definir rango de ese día (solo ese miércoles)
+START_DT <- as.POSIXct(WED_DT, tz = lubridate::tz(cad$.dt))
+END_DT   <- START_DT + lubridate::days(1)
+
+message(sprintf("Día seleccionado: [%s, %s)", START_DT, END_DT))
+
+# Filtrar solo los registros de ese miércoles
+cad_w <- cad %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+jua_w <- jua %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+
+stopifnot(nrow(cad_w) > 2, nrow(jua_w) > 2)
+
+cad_w <- cad_w %>% select(-any_of(c(DATE_COL_CAD, ".dt_raw", ".dt")))
+jua_w <- jua_w %>% select(-any_of(c(DATE_COL_JUA, ".dt_raw", ".dt")))
+
+cad_w <- cad_w %>% select(-any_of("NOX"))
+jua_w <- jua_w %>% select(-any_of("NOX"))
+
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+
+TARGET <- "PM10"
+
+stopifnot(TARGET %in% names(cad_w), TARGET %in% names(jua_w))
+
+num_cols <- cad_w %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")
+x_cols <- setdiff(num_cols, drop_cols)
+
+x_cols <- x_cols[x_cols %in% names(cad_w)]
+stopifnot(length(x_cols) > 0)
+
+sd_vec <- sapply(cad_w[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad_w[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+
+scale_stats <- cad_w %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE),
+                        sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad_w, scale_stats, x_cols)
+jua_s <- scale_apply(jua_w, scale_stats, x_cols)
+
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+print(summary(modelo_SO2))
+
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> dplyr::mutate(dataset = "Cadereyta (train, 1 semana)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> dplyr::mutate(dataset = "Guadalupe (test, 1 semana)")
+
+print(bind_rows(train_met, test_met))
+
+print(vif(modelo_SO2))
+print(bptest(modelo_SO2))
+print(dwtest(modelo_SO2))
+
+print(ad.test(resid(modelo_SO2)))
+print(lillie.test(scale(resid(modelo_SO2))))
+print(jarque.bera.test(resid(modelo_SO2)))
+
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta (1 semana)", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Guadalupe (misma semana)", x = "Observado", y = "Predicho")
+
+p_train + p_test
+
+```
+
+## PM2.5
+
+```{r}
+cad  <- read_excel("cadereyta_SE3.xlsx")
+jua  <- read_excel("cadereyta_SE.xlsx")
+
+find_date_col <- function(df){
+  cand <- grep("date|fecha|time|datetime|hora", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(cand) == 0) stop("No se encontró una columna de fecha/hora. Renombra o agrega una.")
+  cand[1]
+}
+
+DATE_COL_CAD <- find_date_col(cad)
+DATE_COL_JUA <- find_date_col(jua)
+
+parse_dt <- function(df, date_col) {
+  df %>%
+    mutate(
+      .dt_raw = .data[[date_col]],
+      .dt = suppressWarnings(parse_date_time(
+        .dt_raw,
+        orders = c("Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
+                   "d/m/Y H:M:S", "d/m/Y H:M", "d/m/Y",
+                   "Ymd HMS", "Ymd HM", "Ymd")
+      ))
+    )
+}
+
+cad <- parse_dt(cad, DATE_COL_CAD)
+jua <- parse_dt(jua, DATE_COL_JUA)
+
+if (all(is.na(cad$.dt))) stop("No se pudo parsear la fecha/hora en Cadereyta.")
+if (all(is.na(jua$.dt))) stop("No se pudo parsear la fecha/hora en Juárez.")
+
+# Función auxiliar: obtener el 15.º miércoles del año
+nth_wednesday <- function(dt_vec, n = 15) {
+  # Extraer solo las fechas (sin hora)
+  dates <- lubridate::as_date(dt_vec)
+  # Filtrar los miércoles
+  wed_dates <- sort(unique(dates[lubridate::wday(dates, week_start = 1) == 3]))
+  if (length(wed_dates) < n) stop("No hay suficientes miércoles en los datos.")
+  wed_dates[n]
+}
+
+# Obtener el 15.º miércoles
+WED_DT <- nth_wednesday(cad$.dt, n = 15)
+
+# Definir rango de ese día (solo ese miércoles)
+START_DT <- as.POSIXct(WED_DT, tz = lubridate::tz(cad$.dt))
+END_DT   <- START_DT + lubridate::days(1)
+
+message(sprintf("Día seleccionado: [%s, %s)", START_DT, END_DT))
+
+# Filtrar solo los registros de ese miércoles
+cad_w <- cad %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+jua_w <- jua %>% dplyr::filter(.dt >= START_DT, .dt < END_DT)
+
+stopifnot(nrow(cad_w) > 2, nrow(jua_w) > 2)
+
+cad_w <- cad_w %>% select(-any_of(c(DATE_COL_CAD, ".dt_raw", ".dt")))
+jua_w <- jua_w %>% select(-any_of(c(DATE_COL_JUA, ".dt_raw", ".dt")))
+
+cad_w <- cad_w %>% select(-any_of("NOX"))
+jua_w <- jua_w %>% select(-any_of("NOX"))
+
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+
+TARGET <- "SO2"
+
+stopifnot(TARGET %in% names(cad_w), TARGET %in% names(jua_w))
+
+num_cols <- cad_w %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")
+x_cols <- setdiff(num_cols, drop_cols)
+
+x_cols <- x_cols[x_cols %in% names(cad_w)]
+stopifnot(length(x_cols) > 0)
+
+sd_vec <- sapply(cad_w[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad_w[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+
+scale_stats <- cad_w %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE),
+                        sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad_w, scale_stats, x_cols)
+jua_s <- scale_apply(jua_w, scale_stats, x_cols)
+
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+print(summary(modelo_SO2))
+
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> dplyr::mutate(dataset = "Cadereyta (train, 1 semana)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> dplyr::mutate(dataset = "Guadalupe (test, 1 semana)")
+
+print(bind_rows(train_met, test_met))
+
+print(vif(modelo_SO2))
+print(bptest(modelo_SO2))
+print(dwtest(modelo_SO2))
+
+print(ad.test(resid(modelo_SO2)))
+print(lillie.test(scale(resid(modelo_SO2))))
+print(jarque.bera.test(resid(modelo_SO2)))
+
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta (1 semana)", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Guadalupe (misma semana)", x = "Observado", y = "Predicho")
+
+p_train + p_test
+
+```
