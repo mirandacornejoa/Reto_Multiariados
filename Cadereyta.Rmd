@@ -1,0 +1,721 @@
+---
+title: "Cadereyta"
+author: "Hugo Jaime Valdés A01384039"
+date: "2025-10-15"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(car)
+library(lmtest)
+library(patchwork)
+library(readxl)
+```
+
+```{r}
+cad = read_excel("cadereyta_SE3.xlsx")
+jua = read_excel("cadereyta_SE2.xlsx")
+guad = read_excel("cadereyta_SE.xlsx")
+```
+
+
+# Cadereyta - Juarez
+
+```{r}
+colnames(cad)
+```
+```{r}
+# -------- Limpieza ligera --------
+# (No transformamos nombres para respetar tus columnas tal cual)
+# Simplemente quitamos 'date' si está presente:
+cad <- cad %>% select(-any_of("date"))
+jua <- jua %>% select(-any_of("date"))
+
+cad <- cad %>% select(-any_of("NOX"))
+jua <- jua %>% select(-any_of("NOX"))
+
+# -------- Métricas sin yardstick --------
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+```
+
+## Caderyta - Juarez (SO2)
+```{r}
+# Variable objetivo
+TARGET <- "SO2"
+```
+
+```{r}
+# -------- Selección de predictores numéricos --------
+stopifnot(TARGET %in% names(cad), TARGET %in% names(jua))
+
+num_cols <- cad %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # quita objetivo y columnas no predictoras
+x_cols <- setdiff(num_cols, drop_cols)
+
+# Safety: por si acaso
+x_cols <- x_cols[x_cols %in% names(cad)]
+stopifnot(length(x_cols) > 0)
+
+# -------- Filtros anti-colinealidad (en TRAIN) --------
+# 1) varianza cero
+sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+# 3) colinealidad perfecta |r|≈1
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+```
+
+```{r}
+# -------- Estandarización (medias/sd de Cadereyta) --------
+scale_stats <- cad %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad, scale_stats, x_cols)
+jua_s <- scale_apply(jua, scale_stats, x_cols)
+```
+
+```{r}
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_SO2 <- lm(form, data = cad_s)
+summary(modelo_SO2)
+```
+
+```{r}
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> mutate(dataset = "Cadereyta (train)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> mutate(dataset = "Juárez (test)")
+
+bind_rows(train_met, test_met)
+```
+
+```{r}
+vif(modelo_SO2) |> print()
+bptest(modelo_SO2) |> print()
+dwtest(modelo_SO2) |> print()
+```
+
+```{r}
+library(nortest)
+ad.test(resid(modelo_SO2))            # Anderson–Darling
+lillie.test(scale(resid(modelo_SO2))) # Lilliefors (KS ajustado)
+
+library(tseries)
+jarque.bera.test(resid(modelo_SO2))   # Jarque–Bera (asimetría/curtosis)
+```
+
+```{r}
+# QQ plot de residuales
+res <- residuals(modelo_SO2)
+qqnorm(res); qqline(res)
+```
+
+```{r}
+# =========================
+# 7️⃣ GRÁFICAS DE AJUSTE
+# =========================
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5, color="steelblue") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez", x = "Observado", y = "Predicho")
+
+p_train + p_test
+```
+
+## Cadereyta - Juarez (PM10)
+```{r}
+# Variable objetivo
+TARGET <- "PM10"
+```
+
+```{r}
+# -------- Selección de predictores numéricos --------
+stopifnot(TARGET %in% names(cad), TARGET %in% names(jua))
+
+num_cols <- cad %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # quita objetivo y columnas no predictoras
+x_cols <- setdiff(num_cols, drop_cols)
+
+# Safety: por si acaso
+x_cols <- x_cols[x_cols %in% names(cad)]
+stopifnot(length(x_cols) > 0)
+
+# -------- Filtros anti-colinealidad (en TRAIN) --------
+# 1) varianza cero
+sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+# 2) columnas duplicadas (idénticas)
+if (length(x_cols) > 1) {
+  mat <- cad[x_cols]
+  keep <- c()
+  sigs <- new.env(parent = emptyenv())
+  for (nm in x_cols) {
+    key <- digest::digest(mat[[nm]]) %||% paste0(round(mat[[nm]], 10), collapse="|")
+    if (!exists(key, envir = sigs)) { assign(key, TRUE, envir = sigs); keep <- c(keep, nm) }
+  }
+  x_cols <- keep
+}
+
+# 3) colinealidad perfecta |r|≈1
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+```
+
+```{r}
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_PM10 <- lm(form, data = cad_s)
+summary(modelo_PM10)
+```
+
+```{r}
+pred_train <- predict(modelo_PM10, newdata = cad_s)
+pred_test  <- predict(modelo_PM10, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> mutate(dataset = "Cadereyta (train)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> mutate(dataset = "Juárez (test)")
+
+bind_rows(train_met, test_met)
+```
+Las variables 
+
+```{r}
+vif(modelo_PM10) |> print()
+bptest(modelo_PM10) |> print()
+dwtest(modelo_PM10) |> print()
+```
+```{r}
+library(nortest)
+ad.test(resid(modelo_PM10))            # Anderson–Darling
+lillie.test(scale(resid(modelo_PM10))) # Lilliefors (KS ajustado)
+
+library(tseries)
+jarque.bera.test(resid(modelo_PM10))   # Jarque–Bera (asimetría/curtosis)
+```
+
+```{r}
+# QQ plot de residuales
+res <- residuals(modelo_PM10)
+qqnorm(res); qqline(res)
+```
+
+```{r}
+# =========================
+# 7️⃣ GRÁFICAS DE AJUSTE
+# =========================
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5, color="steelblue") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Guadalupe", x = "Observado", y = "Predicho")
+
+p_train + p_test
+```
+
+## Cadereyta - Juarez (PM2.5)
+```{r}
+# Variable objetivo
+TARGET <- "PM2.5"
+```
+
+```{r}
+# -------- Selección de predictores numéricos --------
+stopifnot(TARGET %in% names(cad), TARGET %in% names(jua))
+
+num_cols <- cad %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # quita objetivo y columnas no predictoras
+x_cols <- setdiff(num_cols, drop_cols)
+
+# Safety: por si acaso
+x_cols <- x_cols[x_cols %in% names(cad)]
+stopifnot(length(x_cols) > 0)
+
+# -------- Imputación por mediana (usando solo Cadereyta) --------
+medianas <- cad %>% summarise(across(all_of(c(TARGET, x_cols)), \(x) median(x, na.rm = TRUE)))
+for (v in c(TARGET, x_cols)) {
+  med <- pull(medianas, v)
+  cad[[v]][is.na(cad[[v]])] <- med
+  jua[[v]][is.na(jua[[v]])] <- med
+}
+cad <- cad %>% drop_na(all_of(c(TARGET, x_cols)))
+jua <- jua %>% drop_na(all_of(c(TARGET, x_cols)))
+
+# -------- Filtros anti-colinealidad (en TRAIN) --------
+# 1) varianza cero
+sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+# 2) columnas duplicadas (idénticas)
+if (length(x_cols) > 1) {
+  mat <- cad[x_cols]
+  keep <- c()
+  sigs <- new.env(parent = emptyenv())
+  for (nm in x_cols) {
+    key <- digest::digest(mat[[nm]]) %||% paste0(round(mat[[nm]], 10), collapse="|")
+    if (!exists(key, envir = sigs)) { assign(key, TRUE, envir = sigs); keep <- c(keep, nm) }
+  }
+  x_cols <- keep
+}
+
+# 3) colinealidad perfecta |r|≈1
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+```
+
+```{r}
+# =========================
+# 4️⃣ MODELO LINEAL
+# =========================
+form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
+modelo_PM25 <- lm(form, data = cad_s)
+summary(modelo_PM25)
+```
+
+```{r}
+# =========================
+# 5️⃣ PREDICCIÓN Y MÉTRICAS
+# =========================
+pred_train <- predict(modelo_PM25, newdata = cad_s)
+pred_test  <- predict(modelo_PM25, newdata = jua_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> mutate(dataset = "Cadereyta (train)")
+test_met  <- metricas(jua_s[[TARGET]], pred_test)  |> mutate(dataset = "Juárez (test)")
+
+bind_rows(train_met, test_met)
+```
+
+```{r}
+# =========================
+# 6️⃣ DIAGNÓSTICOS (Cadereyta)
+# =========================
+vif(modelo_PM25) |> print()
+bptest(modelo_PM25) |> print()
+dwtest(modelo_PM25) |> print()
+```
+
+```{r}
+# QQ plot de residuales
+res <- residuals(modelo_PM25)
+qqnorm(res); qqline(res)
+```
+
+```{r}
+library(nortest)
+ad.test(resid(modelo_PM25))            # Anderson–Darling
+lillie.test(scale(resid(modelo_PM25))) # Lilliefors (KS ajustado)
+
+library(tseries)
+jarque.bera.test(resid(modelo_PM25))   # Jarque–Bera (asimetría/curtosis)
+```
+
+```{r}
+# =========================
+# 7️⃣ GRÁFICAS DE AJUSTE
+# =========================
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = jua_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5, color="steelblue") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez", x = "Observado", y = "Predicho")
+
+p_train + p_test
+```
+
+# Cadereyta - Guadalupe
+
+```{r}
+# -------- Limpieza ligera --------
+# (No transformamos nombres para respetar tus columnas tal cual)
+# Simplemente quitamos 'date' si está presente:
+cad <- cad %>% select(-any_of("date"))
+guad <- guad %>% select(-any_of("date"))
+
+cad <- cad %>% select(-any_of("NOX"))
+guad <- guad %>% select(-any_of("NOX"))
+
+# -------- Métricas sin yardstick --------
+rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
+mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
+rsq_vec  <- function(truth, estimate) {
+  truth <- as.numeric(truth); estimate <- as.numeric(estimate)
+  ss_res <- sum((truth - estimate)^2, na.rm = TRUE)
+  ss_tot <- sum((truth - mean(truth, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/ss_tot
+}
+```
+
+## Cadereyta - Guadalupe (SO2)
+```{r}
+# Variable objetivo
+TARGET <- "SO2"
+```
+
+```{r}
+# -------- Selección de predictores numéricos --------
+stopifnot(TARGET %in% names(cad), TARGET %in% names(guad))
+
+num_cols <- cad %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # quita objetivo y columnas no predictoras
+x_cols <- setdiff(num_cols, drop_cols)
+
+# Safety: por si acaso
+x_cols <- x_cols[x_cols %in% names(cad)]
+stopifnot(length(x_cols) > 0)
+
+# -------- Filtros anti-colinealidad (en TRAIN) --------
+# 1) varianza cero
+sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+# 3) colinealidad perfecta |r|≈1
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+```
+
+```{r}
+# -------- Estandarización (medias/sd de Cadereyta) --------
+scale_stats <- cad %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad, scale_stats, x_cols)
+guad_s <- scale_apply(guad, scale_stats, x_cols)
+```
+
+```{r}
+# =========================
+# 5️⃣ PREDICCIÓN Y MÉTRICAS
+# =========================
+pred_train <- predict(modelo_SO2, newdata = cad_s)
+pred_test  <- predict(modelo_SO2, newdata = guad_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> mutate(dataset = "Cadereyta (train)")
+test_met  <- metricas(guad_s[[TARGET]], pred_test)  |> mutate(dataset = "Guadalupe (test)")
+
+bind_rows(train_met, test_met)
+```
+
+```{r}
+# =========================
+# 7️⃣ GRÁFICAS DE AJUSTE
+# =========================
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = guad_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5, color="steelblue") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez", x = "Observado", y = "Predicho")
+
+p_train + p_test
+```
+
+## Cadereyta - Juarez (PM10)
+```{r}
+# Variable objetivo
+TARGET <- "PM10"
+```
+
+```{r}
+# -------- Selección de predictores numéricos --------
+stopifnot(TARGET %in% names(cad), TARGET %in% names(guad))
+
+num_cols <- cad %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # quita objetivo y columnas no predictoras
+x_cols <- setdiff(num_cols, drop_cols)
+
+# Safety: por si acaso
+x_cols <- x_cols[x_cols %in% names(cad)]
+stopifnot(length(x_cols) > 0)
+
+# -------- Filtros anti-colinealidad (en TRAIN) --------
+# 1) varianza cero
+sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+# 3) colinealidad perfecta |r|≈1
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+```
+
+```{r}
+# -------- Estandarización (medias/sd de Cadereyta) --------
+scale_stats <- cad %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad, scale_stats, x_cols)
+guad_s <- scale_apply(guad, scale_stats, x_cols)
+```
+
+```{r}
+# =========================
+# 5️⃣ PREDICCIÓN Y MÉTRICAS
+# =========================
+pred_train <- predict(modelo_PM10, newdata = cad_s)
+pred_test  <- predict(modelo_PM10, newdata = guad_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> mutate(dataset = "Cadereyta (train)")
+test_met  <- metricas(guad_s[[TARGET]], pred_test)  |> mutate(dataset = "Guadalupe (test)")
+
+bind_rows(train_met, test_met)
+```
+
+```{r}
+# =========================
+# 7️⃣ GRÁFICAS DE AJUSTE
+# =========================
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = guad_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5, color="steelblue") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez", x = "Observado", y = "Predicho")
+
+p_train + p_test
+```
+
+
+## Cadereyta - Juarez (PM2.5)
+```{r}
+# Variable objetivo
+TARGET <- "PM2.5"
+```
+
+```{r}
+# -------- Selección de predictores numéricos --------
+stopifnot(TARGET %in% names(cad), TARGET %in% names(guad))
+
+num_cols <- cad %>% select(where(is.numeric)) %>% names()
+drop_cols <- c(TARGET, "nivel_cod", "season")  # quita objetivo y columnas no predictoras
+x_cols <- setdiff(num_cols, drop_cols)
+
+# Safety: por si acaso
+x_cols <- x_cols[x_cols %in% names(cad)]
+stopifnot(length(x_cols) > 0)
+
+# -------- Filtros anti-colinealidad (en TRAIN) --------
+# 1) varianza cero
+sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
+x_cols <- x_cols[sd_vec > 0]
+
+# 3) colinealidad perfecta |r|≈1
+if (length(x_cols) > 1) {
+  cmat <- suppressWarnings(cor(cad[x_cols], use = "pairwise.complete.obs"))
+  bad_pairs <- which(abs(cmat) >= 0.99999 & upper.tri(cmat), arr.ind = TRUE)
+  if (nrow(bad_pairs) > 0) {
+    drop_perfect <- unique(colnames(cmat)[bad_pairs[,2]])
+    x_cols <- setdiff(x_cols, drop_perfect)
+  }
+}
+stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
+```
+
+```{r}
+# -------- Estandarización (medias/sd de Cadereyta) --------
+scale_stats <- cad %>%
+  summarise(across(all_of(x_cols),
+                   list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
+
+scale_apply <- function(data, stats_tbl, cols){
+  out <- data
+  for (v in cols) {
+    mu  <- stats_tbl[[paste0(v, "_mu")]]
+    sdv <- stats_tbl[[paste0(v, "_sd")]]
+    out[[v]] <- if (is.na(sdv) || sdv == 0) 0 else (out[[v]] - mu)/sdv
+  }
+  out
+}
+
+cad_s <- scale_apply(cad, scale_stats, x_cols)
+guad_s <- scale_apply(guad, scale_stats, x_cols)
+```
+
+```{r}
+# =========================
+# 5️⃣ PREDICCIÓN Y MÉTRICAS
+# =========================
+pred_train <- predict(modelo_PM25, newdata = cad_s)
+pred_test  <- predict(modelo_PM25, newdata = guad_s)
+
+metricas <- function(obs, pred){
+  tibble(
+    RMSE = rmse_vec(obs, pred),
+    MAE  = mae_vec(obs, pred),
+    R2   = rsq_vec(obs, pred)
+  )
+}
+
+train_met <- metricas(cad_s[[TARGET]], pred_train) |> mutate(dataset = "Cadereyta (train)")
+test_met  <- metricas(guad_s[[TARGET]], pred_test)  |> mutate(dataset = "Guadalupe (test)")
+
+bind_rows(train_met, test_met)
+```
+
+```{r}
+# =========================
+# 7️⃣ GRÁFICAS DE AJUSTE
+# =========================
+p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Entrenamiento: Cadereyta", x = "Observado", y = "Predicho")
+
+p_test <- tibble(obs = guad_s[[TARGET]], pred = pred_test) |>
+  ggplot(aes(obs, pred)) +
+  geom_point(alpha = 0.5, color="steelblue") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title = "Prueba: Juárez", x = "Observado", y = "Predicho")
+
+p_train + p_test
+```

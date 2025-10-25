@@ -187,6 +187,11 @@ p_train + p_test
 
 ```
 
+```{r}
+colnames(cad)
+```
+
+
 ## PM10
 ```{r}
 cad  <- read_excel("cadereyta_SE3.xlsx")
@@ -513,7 +518,7 @@ p_train + p_test
 
 ```
 
-# Guadalupe
+# Apodaca
 
 ## SO2
 ```{r}
