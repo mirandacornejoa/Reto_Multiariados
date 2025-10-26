@@ -1,0 +1,123 @@
+---
+title: "Analisis Factorial F"
+author: "Leonardo Albarran"
+date: "2025-10-24"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ==== 0) LIBRERÍAS ====
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(lubridate)
+library(psych)
+library(GPArotation)
+library(factoextra)
+
+# ==== 1) LECTURA Y PREPARACIÓN DE LOS DATOS ====
+PATH_SRC <- "C:/Users/albar/OneDrive/Escritorio/SIMA/cadereyta_SE3_2024.xlsx"
+PATH_NE2 <- "C:/Users/albar/OneDrive/Escritorio/SIMA/apodaca_NE2_2024.xlsx"
+PATH_SE2 <- "C:/Users/albar/OneDrive/Escritorio/SIMA/juarez_SE2_2024.xlsx"
+
+read_station <- function(path, name){
+  read_excel(path) |>
+    clean_names() |>
+    mutate(
+      date = as.POSIXct(date, tz = "America/Monterrey"),
+      year = year(date),
+      estacion = name
+    ) |>
+    filter(year == 2024) |>
+    select(estacion, date, co, nox, o3, pm10, pm2_5, so2)
+}
+
+src <- read_station(PATH_SRC, "Cadereyta")
+ne2 <- read_station(PATH_NE2, "Apodaca")
+se2 <- read_station(PATH_SE2, "Juarez")
+
+# Unimos las tres estaciones
+df <- bind_rows(src, ne2, se2)
+
+# Creamos una matriz solo con variables numéricas
+X <- df |> select(co, nox, o3, pm10, pm2_5, so2)
+```
+```{r}
+improve_kmo <- function(X, target = 0.60, min_keep = 5){
+  vars_kept <- colnames(X)
+  steps <- list()
+  repeat {
+    k <- KMO(X)
+    steps[[length(steps)+1]] <- list(KMO = k$MSA, per_var = k$MSAi)
+    if (k$MSA >= target || ncol(X) <= min_keep) break
+    worst <- names(which.min(k$MSAi))
+    message(sprintf("KMO=%.3f < %.2f → removiendo '%s' (MSA=%.3f)",
+                    k$MSA, target, worst, k$MSAi[worst]))
+    X <- X[, setdiff(colnames(X), worst), drop = FALSE]
+    vars_kept <- colnames(X)
+  }
+  list(X = X, kept = vars_kept, log = steps)
+}
+
+kmo_out <- improve_kmo(X, target = 0.60, min_keep = 5)
+X_red   <- kmo_out$X
+vars_kept <- kmo_out$kept
+final_kmo <- KMO(X_red)$MSA
+
+cat("\nVariables finales:", paste(vars_kept, collapse=", "), "\n")
+cat(sprintf("KMO final: %.3f\n", final_kmo))
+
+# 3) Bartlett y paralelo con el set reducido
+bart <- cortest.bartlett(X_red)
+cat(sprintf("Bartlett: Chi2=%.1f, p<%.3g\n", bart$chisq, bart$p.value))
+
+set.seed(1)
+fa.parallel(X_red, fa = "fa", n.iter = 100, show.legend = TRUE,
+            main = "Parallel analysis (con variables depuradas)")
+
+# 4) Ajusta nfactors según el gráfico paralelo (ej. 3 o 4)
+nf <- min(2, ncol(X_red))  # rápido: tope en 4 por tu señal previa
+fa_fit <- fa(X_red, nfactors = nf, rotate = "oblimin", fm = "ml", scores = "regression")
+
+cat("\n=== Cargas factoriales (cut=0.30) ===\n")
+print(fa_fit$loadings, cutoff = 0.30)
+cat("\nComunalidades:\n"); print(round(fa_fit$communality, 3))
+cat("\nVarianza explicada (acumulada):\n"); print(round(fa_fit$Vaccounted, 3))
+
+# 5) Diagrama y matriz de correlación entre factores
+fa.diagram(fa_fit, main = sprintf("FA (%d factores) - Rotación oblimin", nf))
+#print(round(fa_fit$Phi, 3))  # correlación entre factores (si oblimin)
+
+# 6) Sugerencia de interpretación automática (simple)
+top_factor <- apply(abs(as.matrix(fa_fit$loadings)), 1, which.max)
+interpret <- tibble(variable = rownames(fa_fit$loadings),
+                    factor = paste0("F", top_factor),
+                    loading = round(sapply(1:nrow(fa_fit$loadings), function(i)
+                                 fa_fit$loadings[i, top_factor[i]]), 3))
+cat("\nAsignación simple variable→factor (por máxima carga absoluta):\n")
+print(interpret)
+```
+```{r}
+for (st in unique(df$estacion)) {
+  Xi <- df %>% filter(estacion==st) %>% select(co, nox, o3, pm10, pm2_5, so2) %>% drop_na() %>% scale()
+  fit <- psych::fa(Xi, nfactors=2, rotate="oblimin", fm="ml")
+  cat("\n==", st, "==\n"); print(fit$loadings, cutoff=.30)
+  fa.diagram(fit, main = sprintf("FA (2 factores) - Rotación oblimin por estacion", nf))
+}
+
+```
+
+
+
+
+
+
+
+
+
