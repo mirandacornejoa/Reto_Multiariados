@@ -31,7 +31,7 @@ guad = read_excel("cadereyta_SE.xlsx")
 colnames(cad)
 ```
 ```{r}
-# -------- Limpieza ligera --------
+# Limpieza ligera
 # (No transformamos nombres para respetar tus columnas tal cual)
 # Simplemente quitamos 'date' si está presente:
 cad <- cad %>% select(-any_of("date"))
@@ -40,7 +40,7 @@ jua <- jua %>% select(-any_of("date"))
 cad <- cad %>% select(-any_of("NOX"))
 jua <- jua %>% select(-any_of("NOX"))
 
-# -------- Métricas sin yardstick --------
+# Métricas sin yardstick
 rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
 mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
 rsq_vec  <- function(truth, estimate) {
@@ -58,7 +58,7 @@ TARGET <- "SO2"
 ```
 
 ```{r}
-# -------- Selección de predictores numéricos --------
+# Selección de predictores numéricos
 stopifnot(TARGET %in% names(cad), TARGET %in% names(jua))
 
 num_cols <- cad %>% select(where(is.numeric)) %>% names()
@@ -69,7 +69,7 @@ x_cols <- setdiff(num_cols, drop_cols)
 x_cols <- x_cols[x_cols %in% names(cad)]
 stopifnot(length(x_cols) > 0)
 
-# -------- Filtros anti-colinealidad (en TRAIN) --------
+# Filtros anti-colinealidad (en TRAIN)
 # 1) varianza cero
 sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
 x_cols <- x_cols[sd_vec > 0]
@@ -87,7 +87,7 @@ stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
 ```
 
 ```{r}
-# -------- Estandarización (medias/sd de Cadereyta) --------
+# Estandarización (medias/sd de Cadereyta)
 scale_stats <- cad %>%
   summarise(across(all_of(x_cols),
                    list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
@@ -152,9 +152,9 @@ qqnorm(res); qqline(res)
 ```
 
 ```{r}
-# =========================
-# 7️⃣ GRÁFICAS DE AJUSTE
-# =========================
+
+# GRÁFICAS DE AJUSTE
+
 p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
   ggplot(aes(obs, pred)) +
   geom_point(alpha = 0.5) +
@@ -177,7 +177,7 @@ TARGET <- "PM10"
 ```
 
 ```{r}
-# -------- Selección de predictores numéricos --------
+# Selección de predictores numéricos 
 stopifnot(TARGET %in% names(cad), TARGET %in% names(jua))
 
 num_cols <- cad %>% select(where(is.numeric)) %>% names()
@@ -188,7 +188,7 @@ x_cols <- setdiff(num_cols, drop_cols)
 x_cols <- x_cols[x_cols %in% names(cad)]
 stopifnot(length(x_cols) > 0)
 
-# -------- Filtros anti-colinealidad (en TRAIN) --------
+#  Filtros anti-colinealidad (en TRAIN)
 # 1) varianza cero
 sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
 x_cols <- x_cols[sd_vec > 0]
@@ -263,9 +263,7 @@ qqnorm(res); qqline(res)
 ```
 
 ```{r}
-# =========================
-# 7️⃣ GRÁFICAS DE AJUSTE
-# =========================
+# GRÁFICAS DE AJUSTE
 p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
   ggplot(aes(obs, pred)) +
   geom_point(alpha = 0.5) +
@@ -288,7 +286,7 @@ TARGET <- "PM2.5"
 ```
 
 ```{r}
-# -------- Selección de predictores numéricos --------
+# Selección de predictores numéricos 
 stopifnot(TARGET %in% names(cad), TARGET %in% names(jua))
 
 num_cols <- cad %>% select(where(is.numeric)) %>% names()
@@ -299,7 +297,7 @@ x_cols <- setdiff(num_cols, drop_cols)
 x_cols <- x_cols[x_cols %in% names(cad)]
 stopifnot(length(x_cols) > 0)
 
-# -------- Imputación por mediana (usando solo Cadereyta) --------
+# Imputación por mediana (usando solo Cadereyta)
 medianas <- cad %>% summarise(across(all_of(c(TARGET, x_cols)), \(x) median(x, na.rm = TRUE)))
 for (v in c(TARGET, x_cols)) {
   med <- pull(medianas, v)
@@ -309,7 +307,7 @@ for (v in c(TARGET, x_cols)) {
 cad <- cad %>% drop_na(all_of(c(TARGET, x_cols)))
 jua <- jua %>% drop_na(all_of(c(TARGET, x_cols)))
 
-# -------- Filtros anti-colinealidad (en TRAIN) --------
+#  Filtros anti-colinealidad (en TRAIN)
 # 1) varianza cero
 sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
 x_cols <- x_cols[sd_vec > 0]
@@ -339,18 +337,16 @@ stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
 ```
 
 ```{r}
-# =========================
-# 4️⃣ MODELO LINEAL
-# =========================
+
+# MODELO LINEAL
+
 form <- as.formula(paste(TARGET, "~", paste(x_cols, collapse = " + ")))
 modelo_PM25 <- lm(form, data = cad_s)
 summary(modelo_PM25)
 ```
 
 ```{r}
-# =========================
-# 5️⃣ PREDICCIÓN Y MÉTRICAS
-# =========================
+# PREDICCIÓN Y MÉTRICAS
 pred_train <- predict(modelo_PM25, newdata = cad_s)
 pred_test  <- predict(modelo_PM25, newdata = jua_s)
 
@@ -369,9 +365,8 @@ bind_rows(train_met, test_met)
 ```
 
 ```{r}
-# =========================
-# 6️⃣ DIAGNÓSTICOS (Cadereyta)
-# =========================
+
+# DIAGNÓSTICOS (Cadereyta)
 vif(modelo_PM25) |> print()
 bptest(modelo_PM25) |> print()
 dwtest(modelo_PM25) |> print()
@@ -393,9 +388,7 @@ jarque.bera.test(resid(modelo_PM25))   # Jarque–Bera (asimetría/curtosis)
 ```
 
 ```{r}
-# =========================
-# 7️⃣ GRÁFICAS DE AJUSTE
-# =========================
+# GRÁFICAS DE AJUSTE
 p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
   ggplot(aes(obs, pred)) +
   geom_point(alpha = 0.5) +
@@ -423,7 +416,7 @@ guad <- guad %>% select(-any_of("date"))
 cad <- cad %>% select(-any_of("NOX"))
 guad <- guad %>% select(-any_of("NOX"))
 
-# -------- Métricas sin yardstick --------
+# Métricas sin yardstick 
 rmse_vec <- function(truth, estimate) sqrt(mean((as.numeric(truth)-as.numeric(estimate))^2, na.rm = TRUE))
 mae_vec  <- function(truth, estimate) mean(abs(as.numeric(truth)-as.numeric(estimate)), na.rm = TRUE)
 rsq_vec  <- function(truth, estimate) {
@@ -441,7 +434,7 @@ TARGET <- "SO2"
 ```
 
 ```{r}
-# -------- Selección de predictores numéricos --------
+# Selección de predictores numéricos
 stopifnot(TARGET %in% names(cad), TARGET %in% names(guad))
 
 num_cols <- cad %>% select(where(is.numeric)) %>% names()
@@ -452,7 +445,7 @@ x_cols <- setdiff(num_cols, drop_cols)
 x_cols <- x_cols[x_cols %in% names(cad)]
 stopifnot(length(x_cols) > 0)
 
-# -------- Filtros anti-colinealidad (en TRAIN) --------
+# Filtros anti-colinealidad (en TRAIN)
 # 1) varianza cero
 sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
 x_cols <- x_cols[sd_vec > 0]
@@ -470,7 +463,7 @@ stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
 ```
 
 ```{r}
-# -------- Estandarización (medias/sd de Cadereyta) --------
+# Estandarización (medias/sd de Cadereyta)
 scale_stats <- cad %>%
   summarise(across(all_of(x_cols),
                    list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
@@ -490,9 +483,7 @@ guad_s <- scale_apply(guad, scale_stats, x_cols)
 ```
 
 ```{r}
-# =========================
-# 5️⃣ PREDICCIÓN Y MÉTRICAS
-# =========================
+# PREDICCIÓN Y MÉTRICAS
 pred_train <- predict(modelo_SO2, newdata = cad_s)
 pred_test  <- predict(modelo_SO2, newdata = guad_s)
 
@@ -511,9 +502,7 @@ bind_rows(train_met, test_met)
 ```
 
 ```{r}
-# =========================
-# 7️⃣ GRÁFICAS DE AJUSTE
-# =========================
+# GRÁFICAS DE AJUSTE
 p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
   ggplot(aes(obs, pred)) +
   geom_point(alpha = 0.5) +
@@ -536,7 +525,7 @@ TARGET <- "PM10"
 ```
 
 ```{r}
-# -------- Selección de predictores numéricos --------
+# Selección de predictores numéricos
 stopifnot(TARGET %in% names(cad), TARGET %in% names(guad))
 
 num_cols <- cad %>% select(where(is.numeric)) %>% names()
@@ -547,7 +536,7 @@ x_cols <- setdiff(num_cols, drop_cols)
 x_cols <- x_cols[x_cols %in% names(cad)]
 stopifnot(length(x_cols) > 0)
 
-# -------- Filtros anti-colinealidad (en TRAIN) --------
+# Filtros anti-colinealidad (en TRAIN)
 # 1) varianza cero
 sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
 x_cols <- x_cols[sd_vec > 0]
@@ -565,7 +554,7 @@ stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
 ```
 
 ```{r}
-# -------- Estandarización (medias/sd de Cadereyta) --------
+# Estandarización (medias/sd de Cadereyta)
 scale_stats <- cad %>%
   summarise(across(all_of(x_cols),
                    list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
@@ -585,9 +574,7 @@ guad_s <- scale_apply(guad, scale_stats, x_cols)
 ```
 
 ```{r}
-# =========================
-# 5️⃣ PREDICCIÓN Y MÉTRICAS
-# =========================
+# PREDICCIÓN Y MÉTRICAS
 pred_train <- predict(modelo_PM10, newdata = cad_s)
 pred_test  <- predict(modelo_PM10, newdata = guad_s)
 
@@ -606,9 +593,7 @@ bind_rows(train_met, test_met)
 ```
 
 ```{r}
-# =========================
-# 7️⃣ GRÁFICAS DE AJUSTE
-# =========================
+# GRÁFICAS DE AJUSTE
 p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
   ggplot(aes(obs, pred)) +
   geom_point(alpha = 0.5) +
@@ -632,7 +617,7 @@ TARGET <- "PM2.5"
 ```
 
 ```{r}
-# -------- Selección de predictores numéricos --------
+# Selección de predictores numéricos
 stopifnot(TARGET %in% names(cad), TARGET %in% names(guad))
 
 num_cols <- cad %>% select(where(is.numeric)) %>% names()
@@ -643,7 +628,7 @@ x_cols <- setdiff(num_cols, drop_cols)
 x_cols <- x_cols[x_cols %in% names(cad)]
 stopifnot(length(x_cols) > 0)
 
-# -------- Filtros anti-colinealidad (en TRAIN) --------
+# Filtros anti-colinealidad (en TRAIN)
 # 1) varianza cero
 sd_vec <- sapply(cad[x_cols], sd, na.rm = TRUE)
 x_cols <- x_cols[sd_vec > 0]
@@ -661,7 +646,7 @@ stopifnot(!(TARGET %in% x_cols), length(x_cols) > 0)
 ```
 
 ```{r}
-# -------- Estandarización (medias/sd de Cadereyta) --------
+# Estandarización (medias/sd de Cadereyta)
 scale_stats <- cad %>%
   summarise(across(all_of(x_cols),
                    list(mu = \(x) mean(x, na.rm=TRUE), sd = \(x) sd(x, na.rm=TRUE))))
@@ -681,9 +666,7 @@ guad_s <- scale_apply(guad, scale_stats, x_cols)
 ```
 
 ```{r}
-# =========================
-# 5️⃣ PREDICCIÓN Y MÉTRICAS
-# =========================
+# PREDICCIÓN Y MÉTRICAS
 pred_train <- predict(modelo_PM25, newdata = cad_s)
 pred_test  <- predict(modelo_PM25, newdata = guad_s)
 
@@ -702,9 +685,7 @@ bind_rows(train_met, test_met)
 ```
 
 ```{r}
-# =========================
-# 7️⃣ GRÁFICAS DE AJUSTE
-# =========================
+# GRÁFICAS DE AJUSTE
 p_train <- tibble(obs = cad_s[[TARGET]], pred = pred_train) |>
   ggplot(aes(obs, pred)) +
   geom_point(alpha = 0.5) +
@@ -719,3 +700,4 @@ p_test <- tibble(obs = guad_s[[TARGET]], pred = pred_test) |>
 
 p_train + p_test
 ```
+
